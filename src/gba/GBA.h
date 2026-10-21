@@ -104,6 +104,11 @@ extern uint8_t biosProtected[4];
 
 extern void (*cpuSaveGameFunc)(uint32_t, uint8_t);
 
+extern bool gbaSkipRender;
+#ifdef HAVE_DUAL
+// Cable Link: a linked frame (libretro/dual.h)
+void gbaEmulateLinked(int ticks);
+#endif
 extern bool cpuSramEnabled;
 extern bool cpuFlashEnabled;
 extern bool cpuEEPROMEnabled;

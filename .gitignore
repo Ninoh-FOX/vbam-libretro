@@ -24,3 +24,6 @@ vcpkg/*
 
 # mac finder crap
 *.DS_Store
+src/libretro/obj/
+tools/dualtest/dualtest
+tools/dualtest/dualtest-arm

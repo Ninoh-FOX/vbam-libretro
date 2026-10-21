@@ -35,6 +35,16 @@
 
 #include "../filters/interframe.hpp"
 
+#include "dual.h"
+
+// Cable Link over netplay (dual.cpp): in the GBA the player sees only (the
+// hidden GBAs of the link are this file again, see dual.h).
+#if defined(HAVE_DUAL) && !defined(VBA_INSTANCE_B)
+#define CABLE_LINK 1
+#else
+#define CABLE_LINK 0
+#endif
+
 #define FRAMERATE  (16777216.0 / 280896.0) // 59.73
 #define SAMPLERATE 32768.0
 
@@ -66,6 +76,24 @@ static bool option_lcdfilter = false;
 
 // filters
 static IFBFilterFunc ifb_filter_func = NULL;
+
+// frameskip (GBA): frames that are not drawn when the device is too slow
+enum frameskip_type {
+    FRAMESKIP_NONE = 0,
+    FRAMESKIP_AUTO,
+    FRAMESKIP_AUTO_THRESHOLD,
+    FRAMESKIP_FIXED_INTERVAL
+};
+#define FRAMESKIP_MAX 30
+static int frameskip_type = FRAMESKIP_NONE;
+static unsigned frameskip_threshold = 33;
+static unsigned frameskip_interval = 1;
+static unsigned frameskip_counter = 0;
+static bool audio_buff_active = false;
+static unsigned audio_buff_occupancy = 0;
+static bool audio_buff_underrun = false;
+static unsigned audio_latency = 0;
+static bool update_audio_latency = false;
 
 static unsigned retropad_device[4] = {0};
 static unsigned systemWidth = gbaWidth;
@@ -505,7 +533,8 @@ void retro_set_controller_port_device(unsigned port, unsigned device)
     if (port > 3) return;
 
     retropad_device[port] = device;
-    log_cb(RETRO_LOG_INFO, "Controller %d device: %d\n", port + 1, device);
+    if (log_cb)
+        log_cb(RETRO_LOG_INFO, "Controller %d device: %d\n", port + 1, device);
 }
 
 void retro_set_environment(retro_environment_t cb)
@@ -593,7 +622,8 @@ void retro_init(void)
    if (environ_cb(RETRO_ENVIRONMENT_GET_INPUT_BITMASKS, NULL))
    {
       libretro_supports_bitmasks = true;
-      log_cb(RETRO_LOG_INFO, "SET_SUPPORT_INPUT_BITMASK: yes\n");
+      if (log_cb)
+         log_cb(RETRO_LOG_INFO, "SET_SUPPORT_INPUT_BITMASK: yes\n");
    }
 }
 
@@ -933,8 +963,23 @@ void retro_deinit(void)
     libretro_supports_bitmasks = false;
 }
 
+#if CABLE_LINK
+static bool cable_link_enabled = false;
+// While linked: the picture of the last VBlank (see dual.h)
+static uint8_t* dual_front = NULL;
+static bool dual_front_new = false;
+#endif
+
 void retro_reset(void)
 {
+#if CABLE_LINK
+    if (cable_link_enabled && dual_linked()) {
+        // The other consoles have copies of this GBA: every console restarts
+        // every GBA in the same frame (or, while setting up, nothing).
+        dual_request_reset();
+        return;
+    }
+#endif
     core->emuReset();
     set_gbPalette();
 }
@@ -969,6 +1014,68 @@ static uint8_t sensorDarknessLevel = 0; // so we can adjust sensor from gamepad
 static int option_analogDeadzone;
 static int option_gyroSensitivity, option_tiltSensitivity;
 static bool option_swapAnalogSticks;
+
+static void RETRO_CALLCONV audio_buff_status_cb(bool active, unsigned occupancy, bool underrun_likely)
+{
+    audio_buff_active    = active;
+    audio_buff_occupancy = occupancy;
+    audio_buff_underrun  = underrun_likely;
+}
+
+static void init_frameskip(void)
+{
+    audio_latency = 0;
+    if (frameskip_type == FRAMESKIP_NONE || frameskip_type == FRAMESKIP_FIXED_INTERVAL)
+        environ_cb(RETRO_ENVIRONMENT_SET_AUDIO_BUFFER_STATUS_CALLBACK, NULL);
+    else {
+        struct retro_audio_buffer_status_callback buff_status_cb;
+        buff_status_cb.callback = audio_buff_status_cb;
+        if (!environ_cb(RETRO_ENVIRONMENT_SET_AUDIO_BUFFER_STATUS_CALLBACK, &buff_status_cb)) {
+            log("Frameskip disabled: the frontend does not report the audio buffer\n");
+            audio_buff_active    = false;
+            audio_buff_occupancy = 0;
+            audio_buff_underrun  = false;
+        }
+    }
+    if (frameskip_type != FRAMESKIP_NONE) {
+        // More audio latency (6 frames, rounded up to 32 ms) makes underruns rarer
+        audio_latency = (unsigned)(6.0 * 1000.0 / FRAMERATE + 0.5);
+        audio_latency = (audio_latency + 0x1F) & ~0x1F;
+    }
+    update_audio_latency = true;
+    frameskip_counter = 0;
+}
+
+// Whether the frame about to run is drawn
+static bool __attribute__((unused)) frameskip_this_frame(void)
+{
+    bool skip = false;
+
+    switch (frameskip_type) {
+    case FRAMESKIP_AUTO:
+        skip = audio_buff_active && audio_buff_underrun;
+        break;
+    case FRAMESKIP_AUTO_THRESHOLD:
+        skip = audio_buff_active && (audio_buff_occupancy < frameskip_threshold);
+        break;
+    case FRAMESKIP_FIXED_INTERVAL:
+        skip = frameskip_counter < frameskip_interval;
+        if (!skip)
+            frameskip_counter = 0;
+        else
+            frameskip_counter++;
+        return skip;
+    default:
+        return false;
+    }
+
+    if (!skip || frameskip_counter >= FRAMESKIP_MAX) {
+        frameskip_counter = 0;
+        return false;
+    }
+    frameskip_counter++;
+    return true;
+}
 
 static void update_variables(bool startup)
 {
@@ -1207,6 +1314,35 @@ static void update_variables(bool startup)
     else
         ifb_filter_func = NULL;
 
+    var.key = "vbam_frameskip";
+    var.value = NULL;
+    {
+        int prev = frameskip_type;
+        frameskip_type = FRAMESKIP_NONE;
+        if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value) {
+            if (!strcmp(var.value, "auto"))
+                frameskip_type = FRAMESKIP_AUTO;
+            else if (!strcmp(var.value, "auto_threshold"))
+                frameskip_type = FRAMESKIP_AUTO_THRESHOLD;
+            else if (!strcmp(var.value, "fixed_interval"))
+                frameskip_type = FRAMESKIP_FIXED_INTERVAL;
+        }
+        if (startup || frameskip_type != prev)
+            init_frameskip();
+    }
+
+    var.key = "vbam_frameskip_threshold";
+    var.value = NULL;
+    frameskip_threshold = 33;
+    if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+        frameskip_threshold = strtoul(var.value, NULL, 10);
+
+    var.key = "vbam_frameskip_interval";
+    var.value = NULL;
+    frameskip_interval = 1;
+    if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+        frameskip_interval = strtoul(var.value, NULL, 10);
+
     // Hide some core options depending on rom image type
     if (startup) {
         unsigned i;
@@ -1218,10 +1354,13 @@ static void update_variables(bool startup)
             "vbam_showborders",
             "vbam_gbcoloroption"
         };
-        char gba_options[3][22] = {
+        char gba_options[6][25] = {
             "vbam_solarsensor",
             "vbam_gyro_sensitivity",
-            "vbam_forceRTCenable"
+            "vbam_forceRTCenable",
+            "vbam_frameskip",
+            "vbam_frameskip_threshold",
+            "vbam_frameskip_interval"
         };
 
         // Show or hide GB/GBC only options
@@ -1234,7 +1373,7 @@ static void update_variables(bool startup)
 
         // Show or hide GBA only options
         option_display.visible = (type == IMAGE_GBA) ? 1 : 0;
-        for (i = 0; i < 3; i++)
+        for (i = 0; i < 6; i++)
         {
             option_display.key = gba_options[i];
             environ_cb(RETRO_ENVIRONMENT_SET_CORE_OPTIONS_DISPLAY, &option_display);
@@ -1381,6 +1520,44 @@ static void updateInput_Joypad(void)
 static bool firstrun = true;
 static unsigned has_frame;
 
+static unsigned frame_pitch(void)
+{
+    return systemWidth * (systemColorDepth >> 3);
+}
+
+// A frame of the game (not linked)
+static void run_frame(void)
+{
+    has_frame = 0;
+
+    while (!has_frame)
+        core->emuMain(core->emuCount);
+
+    if (gbaSkipRender)
+        video_cb(can_dupe ? NULL : pix, systemWidth, systemHeight, frame_pitch());
+}
+
+#if CABLE_LINK
+// The player's GBA, in a frame of the Cable Link (dual_frame_run)
+static void run_linked_frame(void)
+{
+    gbaEmulateLinked(core->emuCount);
+}
+
+static void dupe_frame(void)
+{
+    video_cb(can_dupe ? NULL : (dualport_active ? dual_front : pix),
+        systemWidth, systemHeight, frame_pitch());
+}
+
+// A frame of silence
+static void output_silence(void)
+{
+    static int16_t zeros[2 * 600];
+    audio_batch_cb(zeros, (size_t)(SAMPLERATE / FRAMERATE + 0.5));
+}
+#endif
+
 void retro_run(void)
 {
     bool updated = false;
@@ -1422,10 +1599,59 @@ void retro_run(void)
     updateInput_SolarSensor();
     updateInput_MotionSensors();
 
-    has_frame = 0;
+    if (update_audio_latency) {
+        environ_cb(RETRO_ENVIRONMENT_SET_MINIMUM_AUDIO_LATENCY, &audio_latency);
+        update_audio_latency = false;
+    }
 
-    while (!has_frame)
-        core->emuMain(core->emuCount);
+#ifdef VBA_INSTANCE_B
+    // A hidden GBA of the Cable Link: never shown, never drawn
+    gbaSkipRender = true;
+#else
+    // (frameskip: GBA only, the GB core is light)
+    gbaSkipRender = (type == IMAGE_GBA) && frameskip_this_frame();
+#endif
+
+#ifdef VBA_INSTANCE_B
+    if (dualport_active) {
+        // A linked frame of this GBA (see dual.h)
+        gbaEmulateLinked(core->emuCount);
+        return;
+    }
+#endif
+
+#if CABLE_LINK
+    if (cable_link_enabled) {
+        if (dual_setting_up()) {
+            // The GBAs of the link are being set up: the game waits.
+            dupe_frame();
+            return;
+        }
+        if (dual_running()) {
+            switch (dual_frame_begin(input_buf[0])) {
+            case DUAL_FRAME_RUN:
+                dual_front_new = false;
+                dual_frame_run();
+                if (dual_front_new)
+                    video_cb(dual_front, systemWidth, systemHeight, frame_pitch());
+                else
+                    dupe_frame();
+                return;
+            case DUAL_FRAME_HOLD:
+                // Ahead of the other consoles: this frame waits (in silence).
+                output_silence();
+                dupe_frame();
+                return;
+            default:
+                // Someone's buttons for this frame are not here yet.
+                dupe_frame();
+                return;
+            }
+        }
+    }
+#endif
+
+    run_frame();
 }
 
 static unsigned serialize_size = 0;
@@ -1444,6 +1670,11 @@ bool retro_serialize(void* data, size_t size)
 
 bool retro_unserialize(const void* data, size_t size)
 {
+#if CABLE_LINK
+    // The copies of this GBA on the other consoles cannot travel in time
+    if (cable_link_enabled && dual_linked())
+        return false;
+#endif
     if (size == serialize_size)
         return core->emuReadState((uint8_t*)data);
     return false;
@@ -1451,6 +1682,11 @@ bool retro_unserialize(const void* data, size_t size)
 
 void retro_cheat_reset(void)
 {
+#if CABLE_LINK
+    // Cheats are off while linked (the copies of this GBA have none)
+    if (cable_link_enabled && dual_linked())
+        return;
+#endif
     cheatsEnabled = 1;
     if (type == IMAGE_GBA)
         cheatsDeleteAll(false);
@@ -1475,6 +1711,11 @@ void retro_cheat_set(unsigned index, bool enabled, const char* code)
     int codeLineSize = strlen(code) + 5;
     int codePos = 0;
     int i = 0;
+
+#if CABLE_LINK
+    if (cable_link_enabled && dual_linked())
+        return;
+#endif
 
     codeLine = (char *)calloc(codeLineSize, sizeof(char));
     sprintf(name, "cheat_%d", index);
@@ -1546,6 +1787,201 @@ static void update_input_descriptors(void)
         environ_cb(RETRO_ENVIRONMENT_SET_INPUT_DESCRIPTORS, input_gba);
     }
 }
+
+#ifdef HAVE_DUAL
+// Every instance: a hidden GBA becomes the same machine as the player's one
+// (the player may have changed the options since it was loaded).
+extern "C" void dualinst_same_machine(const uint8_t* bios_data, int use_bios, int rtc)
+{
+    if (bios && bios_data && bios != bios_data)
+        memcpy(bios, bios_data, SIZE_BIOS);
+    useBios = use_bios ? 1 : 0;
+    rtcEnabled = rtc ? 1 : 0;
+    rtcEnable(rtc != 0);
+}
+#endif
+
+#if CABLE_LINK
+// ---- Cable Link over netplay (dual.cpp) ----
+
+static void show_message(const char* text, unsigned ms)
+{
+    unsigned version = 0;
+    if (!environ_cb(RETRO_ENVIRONMENT_GET_MESSAGE_INTERFACE_VERSION, &version) || version >= 1) {
+        struct retro_message_ext msg;
+        msg.msg = text;
+        msg.duration = ms;
+        msg.priority = 2;
+        msg.level = RETRO_LOG_INFO;
+        msg.target = RETRO_MESSAGE_TARGET_ALL;
+        msg.type = RETRO_MESSAGE_TYPE_NOTIFICATION;
+        msg.progress = -1;
+        if (environ_cb(RETRO_ENVIRONMENT_SET_MESSAGE_EXT, &msg))
+            return;
+    }
+    struct retro_message msg;
+    msg.msg = text;
+    msg.frames = ms / 17;
+    environ_cb(RETRO_ENVIRONMENT_SET_MESSAGE, &msg);
+}
+
+// The player's GBA starts over (the restart that starts a session)
+static void own_reset(void)
+{
+    core->emuReset();
+}
+
+// Put aside while linked: cheats (the ROM patches go out too)
+static void own_link_begin(void)
+{
+    cheatsDeleteAll(true);
+}
+
+// What makes this GBA another machine than the same game elsewhere (the ROM
+// and BIOS are compared on their own).
+static uint32_t own_machine_cfg(void)
+{
+    uint32_t v = 0;
+    v |= rtcIsEnabled() ? 1 : 0;
+    v |= mirroringEnable ? 2 : 0;
+    v |= skipBios ? 4 : 0;
+    v |= speedHack ? 8 : 0;
+    v |= ((uint32_t)cpuSaveType & 0xF) << 4;
+    v |= ((uint32_t)saveType & 0xF) << 8;
+    v |= ((uint32_t)flashSize >> 16) << 12;
+    v |= ((uint32_t)eepromSize >> 9) << 16;
+    v |= cpuIsMultiBoot ? (1u << 24) : 0;
+    return v;
+}
+
+static const uint8_t* own_bios(int* use_bios)
+{
+    *use_bios = useBios ? 1 : 0;
+    return bios;
+}
+
+static int own_rtc_enabled(void)
+{
+    return rtcIsEnabled() ? 1 : 0;
+}
+
+static size_t own_serialize_size(void)
+{
+    return serialize_size;
+}
+
+static int own_serialize(void* data, size_t size)
+{
+    return size >= serialize_size && core->emuWriteState((uint8_t*)data);
+}
+
+static int own_unserialize(const void* data, size_t size)
+{
+    return size == serialize_size && core->emuReadState((const uint8_t*)data);
+}
+
+static unsigned cable_players_option(void)
+{
+    struct retro_variable var;
+    unsigned players = 2;
+    var.key = "vbam_cable_players";
+    var.value = NULL;
+    if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+        players = (unsigned)strtoul(var.value, NULL, 10);
+    if (players < 2 || players > DUAL_MAX_PLAYERS)
+        players = 2;
+    return players;
+}
+
+static unsigned netplay_clients = 0;
+
+static void RETRO_CALLCONV netpacket_start(uint16_t client_id,
+    retro_netpacket_send_t send, retro_netpacket_poll_receive_t poll_receive)
+{
+    // (read again: it may have been changed in the menu just before)
+    dual_set_players(cable_players_option());
+    netplay_clients = 0;
+    dual_set_net(send, poll_receive);
+    dual_session_start(client_id);
+}
+
+static void RETRO_CALLCONV netpacket_receive(const void* buf, size_t len, uint16_t client_id)
+{
+    dual_net_receive(buf, len, client_id);
+}
+
+static void RETRO_CALLCONV netpacket_stop(void)
+{
+    dual_session_stop();
+    netplay_clients = 0;
+}
+
+static bool RETRO_CALLCONV netpacket_connected(uint16_t client_id)
+{
+    const unsigned players = cable_players_option();
+    // The cable has 4 ends: a client id past 3 has no room on it.
+    if (netplay_clients + 1 >= players || client_id >= DUAL_MAX_PLAYERS)
+        return false;
+    if (!dual_peer_connected(client_id))
+        return false;
+    netplay_clients++;
+    return true;
+}
+
+static void RETRO_CALLCONV netpacket_disconnected(uint16_t client_id)
+{
+    if (netplay_clients)
+        netplay_clients--;
+    dual_peer_disconnected(client_id);
+}
+
+static const struct retro_netpacket_callback netpacket_iface = {
+    netpacket_start,
+    netpacket_receive,
+    netpacket_stop,
+    NULL,
+    netpacket_connected,
+    netpacket_disconnected,
+    "VBA-M dual cable 1",
+};
+
+static void cable_link_load(const struct retro_game_info* game)
+{
+    struct retro_variable var;
+    dual_frontend fe;
+
+    cable_link_enabled = false;
+    var.key = "vbam_cable_link";
+    var.value = NULL;
+    if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value && !strcmp(var.value, "disabled"))
+        return;
+
+    free(dual_front);
+    dual_front = (uint8_t*)calloc(1, 4 * 240 * 160);
+    if (!dual_front)
+        return;
+
+    memset(&fe, 0, sizeof(fe));
+    fe.environ_cb = environ_cb;
+    fe.message = show_message;
+    fe.run_frame = run_linked_frame;
+    fe.reset = own_reset;
+    fe.link_begin = own_link_begin;
+    fe.machine_cfg = own_machine_cfg;
+    fe.bios = own_bios;
+    fe.rtc_enabled = own_rtc_enabled;
+    fe.serialize_size = own_serialize_size;
+    fe.serialize = own_serialize;
+    fe.unserialize = own_unserialize;
+    dual_set_frontend(&fe);
+    // (the ROM as loaded, before anything can write into it)
+    dual_game_loaded(game->path, game->data, game->size);
+    dual_set_players(cable_players_option());
+    // The frontend's netplay then lets the core carry the link
+    cable_link_enabled = environ_cb(RETRO_ENVIRONMENT_SET_NETPACKET_INTERFACE,
+        (void*)&netpacket_iface);
+}
+#endif
 
 bool retro_load_game(const struct retro_game_info *game)
 {
@@ -1681,6 +2117,11 @@ bool retro_load_game(const struct retro_game_info *game)
    serialize_size = core->emuWriteState(state_buf);
    free(state_buf);
 
+#if CABLE_LINK
+   if (type == IMAGE_GBA)
+      cable_link_load(game);
+#endif
+
    emulating = 1;
 
    return emulating;
@@ -1693,6 +2134,15 @@ bool retro_load_game_special(unsigned,  const struct retro_game_info *, size_t)
 
 void retro_unload_game(void)
 {
+#if CABLE_LINK
+    if (cable_link_enabled) {
+        dual_game_unloaded();
+        environ_cb(RETRO_ENVIRONMENT_SET_NETPACKET_INTERFACE, NULL);
+    }
+    cable_link_enabled = false;
+    free(dual_front);
+    dual_front = NULL;
+#endif
 }
 
 unsigned retro_get_region(void)
@@ -1720,6 +2170,14 @@ void systemDrawScreen(void)
     unsigned pitch = systemWidth * (systemColorDepth >> 3);
     if (ifb_filter_func)
         ifb_filter_func(pix, pitch, systemWidth, systemHeight);
+#if CABLE_LINK
+    if (dualport_active && dual_front) {
+        // Linked: the picture of this VBlank, shown when the frame ends
+        memcpy(dual_front, pix, pitch * systemHeight);
+        dual_front_new = true;
+        return;
+    }
+#endif
     video_cb(pix, systemWidth, systemHeight, pitch);
 }
 
@@ -1757,6 +2215,11 @@ void systemMessage(int, const char* fmt, ...)
 
 uint32_t systemReadJoypad(int which)
 {
+#ifdef HAVE_DUAL
+    // Linked: the buttons the session gives, the same on every console
+    if (dualport_active)
+        return dualport_get_keys();
+#endif
     if (which == -1)
         which = 0;
     return input_buf[which];
@@ -1789,24 +2252,32 @@ bool systemReadJoypads(void)
 
 static int sensor_tilt[2], sensor_gyro;
 
+// (While linked the sensors stay still: only the buttons travel, and every
+// copy of a GBA must read the same.)
+#ifdef HAVE_DUAL
+#define SENSOR_LINKED(still, live) (dualport_active ? (still) : (live))
+#else
+#define SENSOR_LINKED(still, live) (live)
+#endif
+
 int systemGetSensorX()
 {
-    return sensor_tilt[0];
+    return SENSOR_LINKED(2047, sensor_tilt[0]);
 }
 
 int systemGetSensorY()
 {
-    return sensor_tilt[1];
+    return SENSOR_LINKED(2047, sensor_tilt[1]);
 }
 
 int systemGetSensorZ()
 {
-    return sensor_gyro / 10;
+    return SENSOR_LINKED(0, sensor_gyro / 10);
 }
 
 uint8_t systemGetSensorDarkness(void)
 {
-    return sensorDarkness;
+    return SENSOR_LINKED(0xE8, sensorDarkness);
 }
 
 void systemUpdateMotionSensor(void)

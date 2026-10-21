@@ -1,4 +1,10 @@
 DEBUG=0
+OPT_LEVEL = -O2
+# Cable Link over netplay (dual.cpp, dual.h): every GBA of a link session on
+# each console. Needs pthreads, nm and objcopy, and no LTO (the hidden GBAs
+# are renamed in the object files); the platforms that have it set
+# HAVE_DUAL = 1 below.
+HAVE_DUAL = 0
 TILED_RENDERING=0
 STATIC_LINKING=0
 FRONTEND_SUPPORTS_RGB565=1
@@ -68,6 +74,32 @@ ifneq (,$(findstring unix,$(platform)))
 	fpic := -fPIC
 	SHARED := -shared -Wl,-version-script=$(LIBRETRO_DIR)/link.T -Wl,-no-undefined
 	TILED_RENDERING=1
+	ifneq ($(STATIC_LINKING),1)
+		HAVE_DUAL = 1
+	endif
+
+# Miyoo Mini (Onion, ...): SigmaStar SSD202D, two Cortex-A7 cores, 128 MB.
+# Code kept small for the small caches (as gpSP, mGBA and VBA Next do).
+else ifeq ($(platform), miyoomini)
+	TOOLCHAIN ?= /opt/miyoomini-toolchain/usr/bin/arm-linux-
+	TARGET := $(TARGET_NAME)_libretro.so
+	CC = $(TOOLCHAIN)gcc
+	CXX = $(TOOLCHAIN)g++
+	AR = $(TOOLCHAIN)ar
+	NM = $(TOOLCHAIN)nm
+	OBJCOPY = $(TOOLCHAIN)objcopy
+	fpic := -fPIC
+	SHARED := -shared -Wl,--version-script=$(LIBRETRO_DIR)/link.T -Wl,--no-undefined \
+		-Wl,--gc-sections -s -static-libgcc -static-libstdc++
+	OPT_LEVEL = -Ofast
+	PLATFORM_DEFINES += -marm -mcpu=cortex-a7 -mtune=cortex-a7 -mfpu=neon-vfpv4 -mfloat-abi=hard \
+		-fdata-sections -ffunction-sections -fno-stack-protector -fno-ident \
+		-fomit-frame-pointer -falign-functions=1 -falign-jumps=1 -falign-loops=1 \
+		-fno-unwind-tables -fno-asynchronous-unwind-tables -fno-unroll-loops \
+		-fmerge-all-constants -fno-math-errno
+	TILED_RENDERING = 1
+	# The other GBAs of the Cable Link run on the second core.
+	HAVE_DUAL = 1
 
 # Classic Platforms ####################
 # Platform affix = classic_<ISA>_<µARCH>
@@ -539,7 +571,10 @@ endif
 
 include Makefile.common
 
-OBJS := $(SOURCES_CXX:.cpp=.o)
+# Objects in a directory of their own for each platform (one tree can build
+# several platforms one after the other).
+OBJDIR ?= obj/$(platform)
+OBJS := $(patsubst $(CORE_DIR)/%.cpp,$(OBJDIR)/%.o,$(SOURCES_CXX))
 
 ifeq ($(STATIC_LINKING),1)
 SHARED=
@@ -556,8 +591,8 @@ ifeq ($(DEBUG), 1)
 	CFLAGS += -O0 -g
 	CXXFLAGS += -O0 -g
 else
-	CFLAGS += -O2 -DNDEBUG
-	CXXFLAGS += -O2 -DNDEBUG
+	CFLAGS += $(OPT_LEVEL) -DNDEBUG
+	CXXFLAGS += $(OPT_LEVEL) -DNDEBUG
 endif
 
 CFLAGS += -Wall $(fpic) $(VBA_DEFINES) $(ENDIANNESS_DEFINES) $(PLATFORM_DEFINES)
@@ -595,10 +630,12 @@ else
 	LD = $(CXX)
 endif
 
-%.o: %.cpp
+$(OBJDIR)/%.o: $(CORE_DIR)/%.cpp
+	@mkdir -p $(dir $@)
 	$(CXX) -c $(OBJOUT)$@ $< $(CXXFLAGS) $(INCFLAGS)
 
-%.o: %.c
+$(OBJDIR)/%.o: $(CORE_DIR)/%.c
+	@mkdir -p $(dir $@)
 	$(CC) -c $(OBJOUT)$@ $< $(CFLAGS) $(INCFLAGS)
 
 ifeq ($(platform), theos_ios)
@@ -610,15 +647,56 @@ include $(THEOS_MAKE_PATH)/library.mk
 else
 all: $(TARGET)
 
-$(TARGET): $(OBJS)
+ifeq ($(HAVE_DUAL), 1)
+# Cable Link: the other GBAs (the hidden instances B, C and D) are the core
+# built again with -DVBA_INSTANCE_B, linked into one object, and copied three
+# times with every global it defines renamed gbab_*, gbac_* and gbad_*.
+# What it uses but does not define (libc, libstdc++, the cable bus in
+# dual.cpp, the ROM of the player's GBA) stays shared.
+DUAL_GCC := $(firstword $(filter %g++$(EXE_EXT),$(CXX)))
+ifneq ($(DUAL_GCC),)
+NM      ?= $(patsubst %g++$(EXE_EXT),%nm$(EXE_EXT),$(DUAL_GCC))
+OBJCOPY ?= $(patsubst %g++$(EXE_EXT),%objcopy$(EXE_EXT),$(DUAL_GCC))
+endif
+NM      ?= nm
+OBJCOPY ?= objcopy
+
+# C names carry a leading underscore in the object files on some targets.
+DUAL_SYM_PREFIX := $(word 3,$(shell echo | $(CXX) $(CXXFLAGS) -x c++ -dM -E - 2>/dev/null | grep __USER_LABEL_PREFIX__))
+
+DUAL_B_SOURCES := $(filter-out $(CORE_DIR)/libretro/dual.cpp,$(SOURCES_CXX))
+DUAL_B_OBJECTS := $(patsubst $(CORE_DIR)/%.cpp,$(OBJDIR)/b/%.o,$(DUAL_B_SOURCES))
+DUAL_HIDDEN_OBJECTS := $(OBJDIR)/vbam_b.o $(OBJDIR)/vbam_c.o $(OBJDIR)/vbam_d.o
+
+$(OBJDIR)/b/%.o: $(CORE_DIR)/%.cpp
+	@mkdir -p $(dir $@)
+	$(CXX) -c $(OBJOUT)$@ $< $(CXXFLAGS) $(INCFLAGS) -DVBA_INSTANCE_B
+
+$(OBJDIR)/vbam_hidden.o: $(DUAL_B_OBJECTS)
+	$(CXX) -r -nostdlib -o $@ $(DUAL_B_OBJECTS)
+
+# vbam_b.o: every global renamed gbab_*, and so on.
+$(DUAL_HIDDEN_OBJECTS): $(OBJDIR)/vbam_hidden.o
+	$(NM) -g --defined-only $< | awk -v p='$(DUAL_SYM_PREFIX)' -v n='gba$(subst vbam_,,$(basename $(notdir $@)))_' \
+		'NF == 3 && substr($$3, 1, length(p)) == p { print $$3 " " p n substr($$3, length(p) + 1) }' > $@.syms
+	$(OBJCOPY) --redefine-syms=$@.syms $< $@
+	rm -f $@.syms
+
+LIBS += -lpthread
+else
+DUAL_HIDDEN_OBJECTS :=
+endif
+
+$(TARGET): $(OBJS) $(DUAL_HIDDEN_OBJECTS)
 ifeq ($(STATIC_LINKING), 1)
 	$(AR) rcs $@ $(OBJS)
 else
-	$(LD) $(LINKOUT)$@ $(SHARED) $(OBJS) $(LDFLAGS) $(LIBS)
+	$(LD) $(LINKOUT)$@ $(SHARED) $(OBJS) $(DUAL_HIDDEN_OBJECTS) $(LDFLAGS) $(LIBS)
 endif
 
 clean:
 	rm -f $(OBJS)
+	rm -rf $(OBJDIR)
 	rm -f $(TARGET)
 	rm -f *.a
 

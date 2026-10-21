@@ -27,6 +27,7 @@
 #include "bios.h"
 #include "elf.h"
 #include "ereader.h"
+#include "../libretro/dual.h"
 
 #ifdef PROFILING
 #include "prof/prof.h"
@@ -119,6 +120,10 @@ void (*renderLine)() = mode0RenderLine;
 bool fxOn = false;
 bool windowOn = false;
 int frameCount = 0;
+// The lines of this frame are not drawn: frameskip, and the hidden GBAs of
+// the Cable Link (they are never shown). Drawing changes nothing the game
+// can see.
+bool gbaSkipRender = false;
 char buffer[1024];
 uint32_t lastTime = 0;
 int count = 0;
@@ -510,6 +515,15 @@ inline int CPUUpdateTicks()
         if (IRQTicks < cpuLoopTicks)
             cpuLoopTicks = IRQTicks;
     }
+
+#ifdef HAVE_DUAL
+    // Cable Link: the end of a transfer, the end of a linked frame
+    if (dualport_active) {
+        int dual_ticks = dualport_next_event();
+        if (dual_ticks < cpuLoopTicks)
+            cpuLoopTicks = dual_ticks;
+    }
+#endif
 
     return cpuLoopTicks;
 }
@@ -1352,7 +1366,10 @@ void CPUCleanUp()
 #endif
 
     if (rom != NULL) {
+#ifndef VBA_INSTANCE_B
+        // (a hidden GBA of the Cable Link reads the player's GBA's ROM)
         free(rom);
+#endif
         rom = NULL;
     }
 
@@ -1571,12 +1588,27 @@ int CPULoadRom(const char* szFile)
 int CPULoadRomData(const char* data, int size)
 {
     romSize = SIZE_ROM;
-    if (rom != NULL) {
+    if (rom != NULL || workRAM != NULL) {
         CPUCleanUp();
     }
 
     systemSaveUpdateCounter = SYSTEM_SAVE_NOT_UPDATED;
 
+#ifdef VBA_INSTANCE_B
+    // A hidden GBA of the Cable Link reads the game from the player's GBA:
+    // nothing writes into it while linked (no cheats), and the memory of a
+    // Miyoo Mini has no room for 32 MB more per GBA.
+    (void)data;
+    (void)size;
+    rom = dual_shared_rom(&romSize);
+    if (rom == NULL)
+        return 0;
+    workRAM = (uint8_t*)calloc(1, SIZE_WRAM);
+    if (workRAM == NULL) {
+        rom = NULL;
+        return 0;
+    }
+#else
     rom = (uint8_t*)malloc(SIZE_ROM);
     if (rom == NULL) {
         systemMessage(MSG_OUT_OF_MEMORY, N_("Failed to allocate memory for %s"),
@@ -1601,6 +1633,7 @@ int CPULoadRomData(const char* data, int size)
         WRITE16LE(temp, (i >> 1) & 0xFFFF);
         temp++;
     }
+#endif
 
     bios = (uint8_t*)calloc(1, SIZE_BIOS);
     if (bios == NULL) {
@@ -1663,6 +1696,10 @@ int CPULoadRomData(const char* data, int size)
 
 void doMirroring(bool b)
 {
+#ifdef VBA_INSTANCE_B
+    (void)b; // (done in the shared ROM by the player's GBA)
+    return;
+#endif
     int romSizeRounded = romSize;
     romSizeRounded--;
     romSizeRounded |= romSizeRounded >> 1;
@@ -3037,6 +3074,20 @@ void CPUUpdateRegister(uint32_t address, uint16_t value)
         break;
 
     case COMM_SIOCNT:
+#ifdef HAVE_DUAL
+        if (dualport_active) {
+            // Cable Link: the end of the cable sees it (cpuTotalTicks: how
+            // far into this stretch of code the game is)
+            if (dualport_write_siocnt(value, cpuTotalTicks)) {
+                IF |= 0x80;
+                UPDATE_REG(0x202, IF);
+            }
+            // Back to the scheduler: a transfer that started ends at its
+            // time, an IRQ is taken.
+            cpuNextEvent = cpuTotalTicks;
+            break;
+        }
+#endif
 #ifndef NO_LINK
         StartLink(value);
 #else
@@ -3073,6 +3124,16 @@ void CPUUpdateRegister(uint32_t address, uint16_t value)
 
 
     case COMM_RCNT:
+#ifdef HAVE_DUAL
+        if (dualport_active) {
+            if (dualport_write_rcnt(value, cpuTotalTicks)) {
+                IF |= 0x80;
+                UPDATE_REG(0x202, IF);
+            }
+            cpuNextEvent = cpuTotalTicks;
+            break;
+        }
+#endif
 #ifndef NO_LINK
         StartGPLink(value);
 #else
@@ -3334,8 +3395,10 @@ void CPUInit(const char* biosFileName, bool useBiosFile)
         ioReadable[i] = false;
 
     if (romSize < 0x1fe2000) {
+#ifndef VBA_INSTANCE_B // (the shared ROM has it already)
         *((uint16_t*)&rom[0x1fe209c]) = 0xdffa; // SWI 0xFA
         *((uint16_t*)&rom[0x1fe209e]) = 0x4770; // BX LR
+#endif
     } else {
         agbPrintEnable(false);
     }
@@ -3388,6 +3451,7 @@ void SetSaveType(int st)
 
 void CPUReset()
 {
+#ifndef VBA_INSTANCE_B // (the shared ROM: the player's GBA patches it)
     switch (CheckEReaderRegion()) {
     case 1: //US
         EReaderWriteMemory(0x8009134, 0x46C0DFE0);
@@ -3399,6 +3463,7 @@ void CPUReset()
         EReaderWriteMemory(0x80091A8, 0x46C0DFE0);
         break;
     }
+#endif
     rtcReset();
     // clean registers
     memset(&reg[0], 0, sizeof(reg));
@@ -3536,6 +3601,22 @@ void CPUReset()
     // reset internal state
     holdState = false;
     holdType = 0;
+    // (also what a savestate does not keep: every copy of a GBA of the Cable
+    // Link must start the very same way after a reset)
+    stopState = false;
+    intState = false;
+    IRQTicks = 0;
+    timerOnOffDelay = 0;
+    timer0Value = timer1Value = timer2Value = timer3Value = 0;
+    cpuDmaTicksToUpdate = 0;
+    cpuDmaCount = 0;
+    cpuDmaLast = 0;
+    cpuDmaPC = 0;
+    busPrefetch = false;
+    busPrefetchEnable = false;
+    busPrefetchCount = 0;
+    layerEnableDelay = 0;
+    cpuBreakLoop = false;
 
     biosProtected[0] = 0x00;
     biosProtected[1] = 0xf0;
@@ -3739,6 +3820,14 @@ void CPULoop(int ticks)
 
         updateLoop:
 
+#ifdef HAVE_DUAL
+            // Cable Link: time moves on, what the other GBAs did is applied
+            if (dualport_active && dualport_sync(clockTicks)) {
+                IF |= 0x80;
+                UPDATE_REG(0x202, IF);
+            }
+#endif
+
             if (IRQTicks) {
                 IRQTicks -= clockTicks;
                 if (IRQTicks < 0)
@@ -3837,7 +3926,11 @@ void CPULoop(int ticks)
 
                             uint32_t ext = (joy >> 10);
                             // If no (m) code is enabled, apply the cheats at each LCDline
-                            if ((cheatsEnabled) && (mastercode == 0))
+                            if ((cheatsEnabled) && (mastercode == 0)
+#ifdef HAVE_DUAL
+                                && !dualport_active // (no cheats while linked)
+#endif
+                                )
                                 remainingTicks += cheatsCheckKeys(P1 ^ 0x3FF, ext);
 
                             speedup = false;
@@ -3868,7 +3961,9 @@ void CPULoop(int ticks)
 
                             psoundTickfn();
 
-                            if (frameCount >= framesToSkip) {
+                            if (gbaSkipRender) {
+                                // (frameskip: this frame was not drawn)
+                            } else if (frameCount >= framesToSkip) {
                                 systemDrawScreen();
                                 frameCount = 0;
                             } else
@@ -3883,7 +3978,7 @@ void CPULoop(int ticks)
                         CPUCompareVCOUNT();
 
                     } else {
-                        if (frameCount >= framesToSkip) {
+                        if (!gbaSkipRender && frameCount >= framesToSkip) {
                             (*renderLine)();
                             switch (systemColorDepth) {
                             case 16: {
@@ -4214,6 +4309,19 @@ void CPULoop(int ticks)
             if (cpuNextEvent > ticks)
                 cpuNextEvent = ticks;
 
+#ifdef HAVE_DUAL
+            // Cable Link: a linked frame ends at its session time (see dual.h)
+            if (dualport_active) {
+                if (dualport_frame_due()) {
+                    dualport_frame_end();
+                    break;
+                }
+                if (ticks <= 0 || cpuBreakLoop)
+                    break;
+                continue;
+            }
+#endif
+
             // end loop when a frame is done
             if (ticks <= 0 || cpuBreakLoop || has_frames)
                 break;
@@ -4240,6 +4348,103 @@ void gbaEmulate(int ticks)
         CPULoop(ticks);
     } while (!has_frames);
 }
+
+#ifdef HAVE_DUAL
+// Cable Link: a linked frame, until its session time (see dual.h). The
+// buttons are the ones the session gives (systemReadJoypad).
+void gbaEmulateLinked(int ticks)
+{
+    gbaUpdateJoypads();
+    dualport_frame_begin();
+    do {
+        CPULoop(ticks);
+    } while (!dualport_frame_over());
+}
+
+// Everything the game can see, so that the copies of this GBA on the other
+// consoles can be compared. (Not what only the renderer uses: the copies
+// never draw.)
+static uint32_t dual_fnv(uint32_t h, const void* ptr, size_t len)
+{
+    const uint8_t* p = (const uint8_t*)ptr;
+    while (len--)
+        h = (h ^ *p++) * 16777619u;
+    return h;
+}
+
+uint32_t CPUDualHash(void)
+{
+    uint32_t h = 2166136261u;
+    h = dual_fnv(h, workRAM, SIZE_WRAM);
+    h = dual_fnv(h, internalRAM, SIZE_IRAM);
+    h = dual_fnv(h, vram, SIZE_VRAM);
+    h = dual_fnv(h, oam, SIZE_OAM);
+    h = dual_fnv(h, paletteRAM, SIZE_PRAM);
+    h = dual_fnv(h, ioMem, SIZE_IOMEM);
+    h = dual_fnv(h, &reg[0], sizeof(reg));
+    return h;
+}
+
+// (Debugging the Cable Link: the same, part by part)
+void CPUDualHashParts(uint32_t* out)
+{
+    out[0] = dual_fnv(2166136261u, workRAM, SIZE_WRAM);
+    out[1] = dual_fnv(2166136261u, internalRAM, SIZE_IRAM);
+    out[2] = dual_fnv(2166136261u, vram, SIZE_VRAM);
+    out[3] = dual_fnv(2166136261u, ioMem, SIZE_IOMEM);
+    out[4] = dual_fnv(2166136261u, &reg[0], sizeof(reg));
+    out[5] = reg[15].I;
+    out[6] = (uint32_t)lcdTicks | ((uint32_t)VCOUNT << 16);
+    out[7] = (uint32_t)soundTicks;
+}
+
+#ifndef VBA_INSTANCE_B
+// The game of the player's GBA, which the hidden GBAs read too.
+uint8_t* dual_shared_rom(int* size)
+{
+    *size = romSize;
+    return rom;
+}
+#endif
+
+// Cycles from now to the next VBlank (VCOUNT 160), as CPULoop gets there
+// from the LCD state as it is.
+int CPUCyclesToVblank(void)
+{
+    int t = lcdTicks;
+    int v = VCOUNT;
+    bool vblank = (DISPSTAT & 1) != 0;
+    bool hblank = (DISPSTAT & 2) != 0;
+    if (t < 0)
+        t = 0;
+    for (int i = 0; i < 1024; i++) {
+        if (vblank) {
+            if (hblank) {
+                v++;
+                hblank = false;
+                t += 1008;
+            } else {
+                hblank = true;
+                t += 224;
+            }
+            if (v > 227) {
+                v = 0;
+                vblank = hblank = false;
+            }
+        } else if (hblank) {
+            v++;
+            if (v == 160)
+                return t;
+            hblank = false;
+            t += 1008;
+        } else {
+            hblank = true;
+            t += 224;
+        }
+    }
+    return DUAL_FRAME_CYCLES;
+}
+#endif
 
 struct EmulatedSystem GBASystem = {
     // emuMain

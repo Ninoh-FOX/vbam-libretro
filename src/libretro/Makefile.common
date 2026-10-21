@@ -65,3 +65,11 @@ SOURCES_CXX += \
 SOURCES_CXX += \
 	$(CORE_DIR)/filters/interframe.cpp \
 	$(CORE_DIR)/gba/gbafilter.cpp
+
+# Cable Link over netplay (see Makefile and dual.h)
+ifeq ($(HAVE_DUAL), 1)
+VBA_DEFINES += -DHAVE_DUAL
+SOURCES_CXX += \
+	$(CORE_DIR)/libretro/serial_dual.cpp \
+	$(CORE_DIR)/libretro/dual.cpp
+endif

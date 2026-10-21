@@ -4,6 +4,7 @@
 #include "../common/Port.h"
 #include "GBA.h"
 #include "Globals.h"
+#include "../libretro/dual.h"
 
 #include <memory.h>
 #include <string.h>
@@ -109,6 +110,15 @@ static uint8_t toBCD(uint8_t value)
 void SetGBATime()
 {
     time_t long_time;
+#ifdef HAVE_DUAL
+    // Cable Link: the host's local time when the session started plus the
+    // emulated time since (every copy of a GBA must read the very same time)
+    if (dualport_active) {
+        long_time = (time_t)dualport_rtc_seconds();
+        gmtime_r(&long_time, &gba_time);
+        return;
+    }
+#endif
     time(&long_time); /* Get time as long integer. */
     gba_time = *localtime(&long_time); /* Convert to local time. */
 }
@@ -217,7 +227,11 @@ bool rtcWrite(uint32_t address, uint16_t value)
                             break;
 
                         case 0x65: {
-                            if (rtcEnabled)
+                            if (rtcEnabled
+#ifdef HAVE_DUAL
+                                || dualport_active
+#endif
+                                )
                                 SetGBATime();
 
                             rtcClockData.dataLen = 7;
@@ -232,7 +246,11 @@ bool rtcWrite(uint32_t address, uint16_t value)
                         } break;
 
                         case 0x67: {
-                            if (rtcEnabled)
+                            if (rtcEnabled
+#ifdef HAVE_DUAL
+                                || dualport_active
+#endif
+                                )
                                 SetGBATime();
 
                             rtcClockData.dataLen = 3;
