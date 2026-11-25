@@ -100,6 +100,18 @@ else ifeq ($(platform), miyoomini)
 	TILED_RENDERING = 1
 	# The other GBAs of the Cable Link run on the second core.
 	HAVE_DUAL = 1
+	# Profile-guided optimization with a profile recorded on a Miyoo Mini Plus
+	# (games and a Cable Link session, so the hidden GBAs are profiled too).
+	# See pgo/miyoomini/README.md. PGO=generate builds the instrumented core,
+	# PGO=0 builds without the profile.
+	ifeq ($(PGO), generate)
+		PLATFORM_DEFINES += -fprofile-generate=/tmp/pgo
+		LDFLAGS += -fprofile-generate=/tmp/pgo
+	else ifneq ($(PGO), 0)
+		ifneq ($(wildcard pgo/miyoomini/profile),)
+			PLATFORM_DEFINES += -fprofile-use=$(CURDIR)/pgo/miyoomini/profile -fprofile-correction -Wno-error=coverage-mismatch
+		endif
+	endif
 
 # Classic Platforms ####################
 # Platform affix = classic_<ISA>_<µARCH>
