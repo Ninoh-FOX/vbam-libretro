@@ -1560,6 +1560,9 @@ static void output_silence(void)
 
 void retro_run(void)
 {
+#if CABLE_LINK
+    dual_drain_disconnects();
+#endif
     bool updated = false;
 
     if (firstrun) {
@@ -1898,6 +1901,7 @@ static unsigned netplay_clients = 0;
 static void RETRO_CALLCONV netpacket_start(uint16_t client_id,
     retro_netpacket_send_t send, retro_netpacket_poll_receive_t poll_receive)
 {
+    dual_clear_disconnects();
     // (read again: it may have been changed in the menu just before)
     dual_set_players(cable_players_option());
     netplay_clients = 0;
@@ -1932,7 +1936,7 @@ static void RETRO_CALLCONV netpacket_disconnected(uint16_t client_id)
 {
     if (netplay_clients)
         netplay_clients--;
-    dual_peer_disconnected(client_id);
+    dual_peer_disconnected(client_id, netplay_clients);
 }
 
 static const struct retro_netpacket_callback netpacket_iface = {
